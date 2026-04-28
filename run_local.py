@@ -30,6 +30,10 @@ MINEAI_PROXY = Path("/home/mykyta/repos/MineAI/bot/forge-proxy.js")
 # Load .env from the repo root (OPENAI_API_KEY etc.)
 load_dotenv(REPO_ROOT / ".env")
 
+# Disable chromadb's posthog telemetry (their capture() signature changed in
+# newer posthog versions, producing noisy tracebacks that mask real errors).
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
 # ── Config ────────────────────────────────────────────────────────────────
 MC_PORT = int(os.environ.get("MC_PORT", "25566"))
 UPSTREAM_PORT = int(os.environ.get("UPSTREAM_PORT", "25565"))
