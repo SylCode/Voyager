@@ -46,7 +46,7 @@ function getSurroundingBlocks(bot, x_distance, y_distance, z_distance) {
         for (let y = -y_distance; y <= y_distance; y++) {
             for (let z = -z_distance; z <= z_distance; z++) {
                 const block = bot.blockAt(bot.entity.position.offset(x, y, z));
-                if (block && block.type !== 0) {
+                if (block && block.type !== 0 && !block.name.startsWith("stripped_")) {
                     surroundingBlocks.add(block.name);
                 }
             }

@@ -1,4 +1,10 @@
-// Smelt 1 raw_iron into 1 iron_ingot using 1 oak_planks as fuel: smeltItem(bot, "raw_iron", "oak_planks");
+// Smelt 1 raw_iron into 1 iron_ingot using 1 oak_planks as fuel:
+//   const smelted = await smeltItem(bot, "raw_iron", "oak_planks");
+// smeltItem returns the number of items actually smelted. Use the return value
+// to verify success — do NOT use an inventory delta, because chest deposits or
+// other inventory changes can happen during the smelt window and corrupt the delta.
+// Example: const smelted = await smeltItem(bot, "raw_iron", "coal", 3);
+//          if (smelted < 3) bot.chat("Only smelted " + smelted + " raw_iron");
 // You must place a furnace before calling this function
 async function smeltItem(bot, itemName, fuelName, count = 1) {
     const item = mcData.itemsByName[itemName];

@@ -1,14 +1,17 @@
 tqdm
-langchain
+# Voyager imports `from langchain.chat_models import ChatOpenAI`,
+# which only works on the pre-split langchain (<0.1).
+langchain<0.1
 javascript
 setuptools
-openai
+openai<1.0
 chardet
-cchardet
-chromadb==0.3.29
+# cchardet does not build on Python >=3.12; chardet alone is enough.
+# chromadb 0.3.x doesn't build on Python 3.13; bump to a 0.4.x line that
+# still supports the old `langchain.vectorstores.Chroma` API.
+chromadb>=0.4.22,<0.5
 tiktoken
 requests
-setuptools
 gymnasium
 psutil
 minecraft_launcher_lib

@@ -5,6 +5,7 @@ from typing import SupportsFloat, Any, Tuple, Dict
 
 import requests
 import json
+import psutil
 
 import gymnasium as gym
 from gymnasium.core import ObsType
@@ -47,6 +48,48 @@ class VoyagerEnv(gym.Env):
         self.connected = False
         self.server_paused = False
 
+    def _free_stale_mineflayer_listener(self):
+        stale_processes = {}
+        for conn in psutil.net_connections(kind="inet"):
+            laddr = getattr(conn, "laddr", None)
+            if not laddr or conn.status != psutil.CONN_LISTEN:
+                continue
+            port = laddr.port if hasattr(laddr, "port") else None
+            if port != self.server_port or conn.pid is None:
+                continue
+            if (
+                self.mineflayer.process
+                and conn.pid == self.mineflayer.process.pid
+                and self.mineflayer.is_running
+            ):
+                continue
+            try:
+                proc = psutil.Process(conn.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            stale_processes[proc.pid] = proc
+            for child in proc.children(recursive=True):
+                stale_processes[child.pid] = child
+        if not stale_processes:
+            return
+        print(
+            f"Freeing stale mineflayer listener on port {self.server_port}: "
+            f"pids={sorted(stale_processes)}"
+        )
+        processes = list(stale_processes.values())
+        for proc in reversed(processes):
+            try:
+                proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        _, alive = psutil.wait_procs(processes, timeout=3)
+        for proc in alive:
+            try:
+                proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        psutil.wait_procs(alive, timeout=3)
+
     def get_mineflayer_process(self, server_port):
         U.f_mkdir(self.log_path, "mineflayer")
         file_path = os.path.abspath(os.path.dirname(__file__))
@@ -82,12 +125,14 @@ class VoyagerEnv(gym.Env):
             print(f"Server started on port {self.reset_options['port']}")
         retry = 0
         while not self.mineflayer.is_running:
+            self._free_stale_mineflayer_listener()
             print("Mineflayer process has exited, restarting")
             self.mineflayer.run()
             if not self.mineflayer.is_running:
                 if retry > 3:
                     raise RuntimeError("Mineflayer process failed to start")
                 else:
+                    retry += 1
                     continue
             print(self.mineflayer.ready_line)
             res = requests.post(
@@ -150,16 +195,36 @@ class VoyagerEnv(gym.Env):
         }
 
         self.unpause()
-        self.mineflayer.stop()
-        time.sleep(1)  # wait for mineflayer to exit
-
-        returned_data = self.check_process()
+        # HUMAN-LIKE: only restart mineflayer on hard reset (or first reset).
+        # On soft reset, keep the bot alive — real players don't disconnect
+        # between objectives.
+        is_first = not self.has_reset
+        if options.get("mode", "hard") == "hard" or is_first:
+            self.mineflayer.stop()
+            time.sleep(1)  # wait for mineflayer to exit
+            returned_data = self.check_process()
+        else:
+            # Soft reset: bot already running. Just fetch a fresh observation.
+            res = requests.post(
+                f"{self.server}/observe",
+                json={},
+                timeout=self.request_timeout,
+            )
+            if res.status_code != 200:
+                # Fall back to full restart if /observe fails.
+                self.mineflayer.stop()
+                time.sleep(1)
+                returned_data = self.check_process()
+            else:
+                returned_data = res.json()
         self.has_reset = True
         self.connected = True
         # All the reset in step will be soft
         self.reset_options["reset"] = "soft"
         self.pause()
-        return json.loads(returned_data)
+        if isinstance(returned_data, str):
+            return json.loads(returned_data)
+        return returned_data
 
     def close(self):
         self.unpause()

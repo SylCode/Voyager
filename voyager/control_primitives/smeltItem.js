@@ -21,9 +21,38 @@ async function smeltItem(bot, itemName, fuelName, count = 1) {
     });
     if (!furnaceBlock) {
         throw new Error("No furnace nearby");
-    } else {
+    }
+    // Navigate to the furnace. If pathfinding fails (e.g. bot is underground / cave-trapped),
+    // attempt to escape to the surface first and then retry navigation.
+    const _navToFurnace = async () => {
         await bot.pathfinder.goto(
             new GoalLookAtBlock(furnaceBlock.position, bot.world)
+        );
+    };
+    try {
+        await Promise.race([
+            _navToFurnace(),
+            new Promise((_, rej) =>
+                setTimeout(() => rej(new Error("furnace nav timeout")), 20000)
+            ),
+        ]);
+    } catch (_navErr) {
+        bot.chat(`Warning: could not path to furnace (${_navErr.message}), trying to escape cave first`);
+        try {
+            await escapeToSurface(bot);
+        } catch (_escErr) {
+            bot.chat(`Warning: escapeToSurface failed: ${_escErr.message}`);
+        }
+        // Re-locate furnace after potentially moving
+        const _furnaceRetry = bot.findBlock({
+            matching: mcData.blocksByName.furnace.id,
+            maxDistance: 48,
+        });
+        if (!_furnaceRetry) {
+            throw new Error("No furnace found after cave escape");
+        }
+        await bot.pathfinder.goto(
+            new GoalLookAtBlock(_furnaceRetry.position, bot.world)
         );
     }
     const furnace = await bot.openFurnace(furnaceBlock);
@@ -53,8 +82,9 @@ async function smeltItem(bot, itemName, fuelName, count = 1) {
         success_count++;
     }
     furnace.close();
-    if (success_count > 0) bot.chat(`Smelted ${success_count} ${itemName}.`);
-    else {
+    if (success_count > 0) {
+        bot.chat(`Smelted ${success_count} ${itemName}.`);
+    } else {
         bot.chat(
             `Failed to smelt ${itemName}, please check the fuel and input.`
         );
@@ -65,4 +95,8 @@ async function smeltItem(bot, itemName, fuelName, count = 1) {
             );
         }
     }
+    // Return the actual smelted count so callers can verify success directly
+    // without using an inventory delta (which breaks when chest deposit or
+    // other inventory changes happen concurrently during the smelt window).
+    return success_count;
 }

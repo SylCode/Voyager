@@ -1,11 +1,10 @@
 async function givePlacedItemBack(bot, name, position) {
-    await bot.chat("/gamerule doTileDrops false");
-    // iterate name and position
+    // NOTE: removed doTileDrops toggle (was causing race that suppressed mining drops globally).
+    // Use /setblock ... air (no `destroy`) inside the helper instead.
     const history = [];
     for (let i = 0; i < name.length; i++) {
         await givePlacedItemBackSingle(bot, name[i], position[i]);
     }
-    await bot.chat("/gamerule doTileDrops true");
 
     async function givePlacedItemBackSingle(bot, name, position) {
         bot.chat(`/give bot ${name} 1`);
@@ -25,7 +24,7 @@ async function givePlacedItemBack(bot, name, position) {
                         await bot.chat(
                             `/setblock ${x + dx} ${y + dy} ${
                                 z + dz
-                            } air destroy`
+                            } air`
                         );
                         history.push(block.position);
                         await bot.waitForTicks(20);

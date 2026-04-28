@@ -38,8 +38,307 @@ Code:
     4) Functions in the "Code from the last round" section will not be saved or executed. Do not reuse functions listed there.
     5) Anything defined outside a function will be ignored, define all your variables inside your functions.
     6) Call `bot.chat` to show the intermediate progress.
-    7) Use `exploreUntil(bot, direction, maxDistance, callback)` when you cannot find something. You should frequently call this before mining blocks or killing mobs. You should select a direction at random every time instead of constantly using (1, 0, 1).
+    7) Use `exploreUntil(bot, direction, maxDistance, callback)` when you cannot find something. You should frequently call this before mining blocks or killing mobs. You should select a direction at random every time instead of constantly using (1, 0, 1). The direction Vec3 must only contain values of -1, 0, or 1, and MUST NOT be (0, 0, 0). Do NOT use Math.random() * 2 - 1; build the direction with this safe helper that retries until a non-zero (x, z) pair is picked:
+        const _pickDir = () => {{
+            const opts = [-1, 0, 1];
+            for (let _t = 0; _t < 10; _t++) {{
+                const dx = opts[Math.floor(Math.random() * 3)];
+                const dz = opts[Math.floor(Math.random() * 3)];
+                if (dx !== 0 || dz !== 0) return new Vec3(dx, 0, dz);
+            }}
+            return new Vec3(1, 0, 0); // fallback
+        }};
+        // then: await exploreUntil(bot, _pickDir(), 60, callback);
+    7a) NEVER explore for axes, tools, or chests before starting a basic gathering task. Dirt, sand, and gravel are fine bare-handed. WOOD IS THE EXCEPTION on this server: log blocks often break without dropping anything unless an axe is equipped, so do NOT assume punching a tree works. For wood tasks, call `ensureLogsReachable(bot)` first and then use the generic `mineBlock(bot, 'wood log', count)` path. For the VERY FIRST log, do NOT try to craft an axe or crafting table beforehand unless the needed logs/planks are ALREADY in inventory. A helper that only makes logs reachable does NOT put logs into inventory. The first wood attempt must be a real `mineBlock(bot, 'wood log', 1)` call. If that attempt yields zero drops or `mineBlock` throws that no axe/crafting path exists, stop and re-plan instead of inventing an impossible pre-axe crafting chain.
+    7a1) **MANDATORY: ensureLogsReachable() before any wood-dependent step.** If your task or any prerequisite needs logs/planks/sticks/crafting_table/pickaxe (i.e. virtually every early-game task), you MUST call this helper FIRST and re-call it whenever a `findBlock` for any `_log` returns null. Reason: a tight `findBlocks(...maxDistance:32)` very often returns 0 hits when logs sit just outside the radius or are filtered by a too-strict reachability check, even on the surface. The helper widens the search and walks toward logs using pathfinder (which auto-digs through dirt/sand/leaves with bare hands).
+        **CRITICAL — the "Nearby blocks" list is a TRAP if you are underground.** If `Nearby blocks` contains `lava`, `nether_brick_fence`, `bedrock`, or `stone` AND your `Position.y < 64`, you are CAVE-TRAPPED. Even if the list also contains `jungle_wood` / `oak_log` / etc., you almost certainly cannot path to it on bare hands — stone walls block the route and pathfinder will hang for minutes. In this case you MUST first call `ensureLogsReachable(bot)` to pillar up out of the cave with sand/dirt before any `mineBlock("<x>_log"|"<x>_wood", ...)`. Skipping the helper because "the wood is in nearby blocks" is the #1 cause of bot deathlocks. ALWAYS call the helper for any wood task; it is a no-op when wood is genuinely reachable.
+        IMPORTANT — DO NOT try to mine straight up through stone ceilings without a pickaxe. Bare hands cannot break stone/cobblestone/deepslate. The helper instead WALKS horizontally; pathfinder will route around obstacles and dig only soft blocks (dirt, sand, gravel, leaves) which are bare-hand mineable.
+        ```js
+        async function ensureLogsReachable(bot) {{
+          const logMatcher = (b) => b && (b.name.endsWith('_log') || b.name.endsWith('_stem') || b.name.endsWith('_hyphae'));
+          const decorMarker = (b) => b && (
+            b.name.endsWith('_wool') ||
+            b.name.endsWith('_sign') ||
+            b.name.endsWith('_glazed_terracotta') ||
+            b.name === 'note_block' ||
+            b.name === 'jukebox' ||
+            b.name === 'fire' ||
+            b.name === 'campfire' ||
+            b.name === 'soul_campfire'
+          );
+          const decorNearby = (radius = 16) => bot.findBlocks({{ matching: (b) => decorMarker(b), maxDistance: radius, count: 16 }}).length > 0;
+          const decorScoreAt = (position) => {{
+            if (!position) return 0;
+            let score = 0;
+            for (let dy = -1; dy <= 2; dy++) {{
+              for (let dx = -4; dx <= 4; dx++) {{
+                for (let dz = -4; dz <= 4; dz++) {{
+                  const block = bot.blockAt(position.offset(dx, dy, dz));
+                  if (!block || !block.name) continue;
+                  if (decorMarker(block)) score += 1;
+                  if (block.name.endsWith('_wood')) score += 1;
+                }}
+              }}
+            }}
+            return score;
+          }};
+          const scanLogs = (radius) => bot.findBlocks({{ matching: (b) => logMatcher(b), maxDistance: radius, count: 32 }})
+            .map((pos) => bot.blockAt(pos))
+            .filter((block) => block && block.position && block.position.y >= bot.entity.position.y - 2 && decorScoreAt(block.position) === 0)
+            .sort((a, b) => a.position.distanceTo(bot.entity.position) - b.position.distanceTo(bot.entity.position))
+            .map((block) => block.position);
+          const localNaturalLog = (radius = 32) => {{
+            const hits = scanLogs(radius);
+            return !decorNearby() && hits.length > 0 ? bot.blockAt(hits[0]) : null;
+          }};
+          const pickDir = () => {{
+            const opts = [-1, 1];
+            return new Vec3(opts[Math.floor(Math.random() * 2)], 0, opts[Math.floor(Math.random() * 2)]);
+          }};
+          const tryExploreForNaturalLog = async (attempts = 3, maxDistance = 90) => {{
+            for (let i = 0; i < attempts; i++) {{
+              try {{
+                await exploreUntil(bot, pickDir(), maxDistance, () => localNaturalLog(32));
+              }} catch (e) {{}}
+              if (localNaturalLog(32)) return true;
+              if (!decorNearby() && scanLogs(48).length > 0) return true;
+            }}
+            return false;
+          }};
+          if (decorNearby()) {{
+            bot.chat('Leaving decorative area first.');
+            if (await tryExploreForNaturalLog()) return true;
+          }}
+          // 1) Wide-radius scan first — surface logs often >32 blocks away.
+          let hits = scanLogs(64);
+          if (hits.length === 0) hits = scanLogs(96);
+          if (hits.length === 0) hits = scanLogs(128);
+          if (hits.length > 0) {{
+            // 2) Walk to the closest one (pathfinder digs dirt/sand/leaves automatically with bare hands).
+            const {{ goals: G, Movements }} = require('mineflayer-pathfinder');
+            const mcData = require('minecraft-data')(bot.version);
+            const _prevMovements = bot.pathfinder.movements; // save to restore later
+            try {{
+              const moves = new Movements(bot, mcData);
+              moves.canDig = true;
+              moves.allow1by1towers = true;
+              // Pillar only with blocks we can mine back bare-handed.
+              const scaffoldNames = ['dirt','sand','gravel','coarse_dirt','rooted_dirt','dirt_path','podzol','mycelium','grass_block'];
+              moves.scafoldingBlocks = scaffoldNames
+                .map(n => mcData.blocksByName[n] && mcData.blocksByName[n].id)
+                .filter(id => typeof id === 'number');
+              // Restrict digging to soft blocks bare hands can break.
+              const soft = ['dirt','grass_block','sand','gravel','snow','snow_block','clay','farmland','dirt_path','podzol','mycelium','coarse_dirt','rooted_dirt'];
+              moves.blocksCantBreak = new Set();
+              for (const name in mcData.blocksByName) {{
+                const id = mcData.blocksByName[name].id;
+                const isLeaves = name.endsWith('_leaves');
+                if (!soft.includes(name) && !isLeaves) moves.blocksCantBreak.add(id);
+              }}
+              bot.pathfinder.setMovements(moves);
+              hits.sort((a, b) => a.distanceTo(bot.entity.position) - b.distanceTo(bot.entity.position));
+              const target = hits[0];
+              await Promise.race([
+                bot.pathfinder.goto(new G.GoalNear(target.x, target.y, target.z, 2)),
+                new Promise(r => setTimeout(r, 30000))
+              ]);
+            }} catch (e) {{ /* fall through to exploration */ }}
+            finally {{
+              // CRITICAL: restore default movements so subsequent mineBlock / pathfinder calls work normally.
+              if (_prevMovements) bot.pathfinder.setMovements(_prevMovements);
+              else bot.pathfinder.setMovements(new Movements(bot, mcData));
+            }}
+            if (!decorNearby() && scanLogs(8).length > 0) return true;
+          }}
+          // 3) No logs in scanner range — explore horizontally with exploreUntil. Bare hand can dig dirt/sand
+          //    walls; pathfinder will path around stone. Pick a non-zero horizontal direction.
+          bot.chat("No logs nearby; exploring for wood.");
+          if (await tryExploreForNaturalLog()) return true;
+          return !!localNaturalLog(48);
+        }}
+        ```
+        Call sequence: `if (!await ensureLogsReachable(bot)) {{ bot.chat("Failed: cannot reach any logs after exploring."); return; }}` BEFORE you do any `mineBlock(bot, '<x>_log', ...)` or `exploreUntil(... log ...)`. The bot has bare hands at task start — do NOT try to mine stone ceilings or pillar with stone you can't break back. Walking horizontally with pathfinder is always the right move when no logs are found at the current spot.
+    7b) NEVER explore to find a crafting table if you can craft one yourself. A crafting table requires only 4 wooden planks (any type). If you have wooden planks (or logs you can convert to planks in a 2x2 grid), craft a crafting table and place it at your feet BEFORE attempting any recipe that requires one. The crafting table is only a 2x2 recipe and does NOT require an existing crafting table.
+      ABSOLUTE RULE — DO NOT MINE WOOD IF YOU ALREADY HAVE THE INGREDIENTS:
+      Before EVERY `mineBlock(bot, 'wood log', ...)` or `ensureLogsReachable(bot)` call, check inventory FIRST:
+        - For `wooden_pickaxe` (needs 3 planks + 2 sticks): if `countPlanks() >= 3 && countSticks() >= 2`, SKIP all wood mining and call `await craftItem(bot, 'wooden_pickaxe', 1)` directly. `craftItem` will find/place a crafting table for you.
+        - For `crafting_table` (needs 4 planks): if `countPlanks() >= 4`, SKIP wood mining and call `await craftItem(bot, 'crafting_table', 1)` directly.
+        - For `wooden_axe`/`wooden_sword`/`wooden_shovel`/`wooden_hoe`: same — if planks+sticks suffice, skip mining.
+      Only mine wood if planks+sticks are TRULY insufficient (counting 1 log → 4 planks). Do NOT use the over-cautious `countPlanks() + 4*countLogs() < 7` formula — for a wooden pickaxe alone the threshold is `< 3` planks (assuming 2 sticks present). The `+4` for the table is only needed when no placed table exists AND no `crafting_table` item is carried.
+      CRITICAL: do NOT craft a new `crafting_table` just because one is not in inventory. FIRST search for an already-placed `crafting_table` in the world, and reuse it if found. Repeatedly crafting new tables while standing near an existing one is a bug.
+      CRITICAL: `await craftItem(bot, 'crafting_table', 1)` only crafts the table item into inventory. It does NOT place the table in the world. So the sequence `craftItem('crafting_table')` followed immediately by `findBlock('crafting_table')` is wrong and will often fail.
+      IMPORTANT: for 3x3 recipes such as `wooden_pickaxe`, once you already have enough planks and sticks, prefer calling `await craftItem(bot, 'wooden_pickaxe', 1)` directly. `craftItem` already reuses a nearby placed table and only tries to place a carried table when needed. After crafting a `crafting_table` item, the preferred next step is to call `await craftItem(bot, 'wooden_pickaxe', 1)`, not to fail because no placed table is visible yet.
+      Only call `placeItem(bot, 'crafting_table', position)` yourself if you specifically need the table to stay placed in the world for later use or `craftItem(bot, 'wooden_pickaxe', 1)` already failed because there was no safe nearby spot.
+      CRITICAL arithmetic: if there is NO placed crafting table nearby and NO `crafting_table` item already in inventory, then `wooden_pickaxe` effectively costs **7 planks total**: 4 planks for the table plus 3 planks for the pickaxe. Example: `2 planks + 1 log + 4 sticks + no crafting_table` is STILL not enough for a wooden pickaxe, because 1 log only yields 4 more planks → 6 total, and crafting a table leaves you with 2 planks. In that situation you must either (a) reuse an already-placed table in the world, or (b) gather at least one more log/plank before attempting the pickaxe. Once you DO have a carried or placed crafting table, then `2 planks + 1 log + 4 sticks + 1 crafting_table` is enough, because the extra log only needs to cover the final missing plank.
+        IMPORTANT: Do NOT use `mcData.itemsByName` to check for planks — this only covers vanilla items and misses modded planks (BiomesOPlenty, Twilight Forest, Quark, etc.). Instead, use `bot.inventory.items()` and match by name. Example logic:
+        // Check nearby first
+        // IMPORTANT: Use name-based matching for findBlock — Forge remaps numeric block IDs so
+        // mcData.blocksByName.crafting_table.id may NOT match the actual placed block on modded servers.
+        let craftingTable = bot.findBlock({{ matching: (b) => b.name === 'crafting_table', maxDistance: 64 }});
+        if (!craftingTable && bot.inventory.items().filter(i => i.name.endsWith('_planks')).reduce((s,i) => s+i.count, 0) >= 3 && bot.inventory.items().filter(i => i.name === 'stick').reduce((s,i) => s+i.count, 0) >= 2) {{
+            await craftItem(bot, 'wooden_pickaxe', 1);
+            return;
+        }}
+        if (!craftingTable && !bot.inventory.items().some(i => i.name === 'crafting_table')) {{
+            // Sum ALL plank types (vanilla + modded) by matching item name suffix
+            const plankItems = bot.inventory.items().filter(item => item.name.endsWith('_planks'));
+            const totalPlanks = plankItems.reduce((sum, item) => sum + item.count, 0);
+            if (totalPlanks < 4) {{
+                // Try converting any logs we have to planks first (works for vanilla logs via 2x2 grid)
+                const logItem = bot.inventory.items().find(item => item.name.endsWith('_log') || item.name.endsWith('_wood'));
+                if (logItem) {{
+                    // Derive plank name: e.g. spruce_log → spruce_planks
+                    const plankName = logItem.name.replace(/_log$/, '_planks').replace(/_wood$/, '_planks');
+                    await craftItem(bot, plankName, 4);
+                }}
+            }}
+            const plankItem = bot.inventory.items().find(item => item.name.endsWith('_planks'));
+            if (plankItem && bot.inventory.items().filter(i => i.name.endsWith('_planks')).reduce((s,i) => s+i.count, 0) >= 4) {{
+                await craftItem(bot, 'crafting_table', 1);
+              await craftItem(bot, 'wooden_pickaxe', 1);
+              return;
+            }}
+        }}
+    7c) NEVER call `exploreUntil` to find "a place to put a block" unless the current pocket is visibly blocked on all sides. Start with nearby floor tiles and only take a short horizontal reposition if every local placement attempt failed.
+        Safe placement pattern — look for the floor tiles around you, then place ON TOP of one. `placeItem(...)` throws on failure, so keep trying nearby floor tiles until one succeeds:
+          const _offsets = [];
+          for (let r = 1; r <= 3; r++) {{
+            for (let dx = -r; dx <= r; dx++) {{
+              for (let dz = -r; dz <= r; dz++) {{
+                if (dx === 0 && dz === 0) continue;
+                if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+                _offsets.push([dx,dz]);
+              }}
+            }}
+          }}
+          let _placed = false;
+          for (const [dx,dz] of _offsets) {{
+            const ref = bot.blockAt(bot.entity.position.offset(dx, -1, dz));
+            const target = bot.blockAt(bot.entity.position.offset(dx, 0, dz));
+            if (ref && ref.name !== 'air' && target && (target.name === 'air' || target.boundingBox === 'empty' || target.name === '')) {{
+              try {{
+                await placeItem(bot, name, ref.position.offset(0, 1, 0));
+                _placed = true;
+                break;
+              }} catch (err) {{}}
+            }}
+          }}
+          if (!_placed) {{ bot.chat('Failed: could not place the item nearby.'); return; }}
+        NEVER use negative Y offsets in the target position (like offset(1,-1,0)) — that targets the floor itself, not the air above it, and the bot cannot place into occupied blocks.
+        NEVER try to place on lava, water, fire, or magma_block — placeItem rejects hazardous surfaces automatically.
+        Placing should take <1 second, not 60.
+    7d) STICKS do NOT need a crafting table. They are a 2x2 recipe: 2 planks → 4 sticks. Just call `craftItem(bot, 'stick', 1)` (or however many you need) — `craftItem` handles 2x2 recipes without a table. Same for wooden planks (1 log → 4 planks). Same for the crafting table itself (4 planks → 1 table).
+    7d1) **WOODEN PICKAXE MATERIAL CHECK — mandatory before you plan or code.** For `wooden_pickaxe`, compute the requirement explicitly:
+      - `hasTableAccess = (crafting_table item in inventory) OR (placed crafting_table found nearby)`
+      - `totalPotentialPlanks = current planks + 4 * current logs`
+      - `requiredPlanks = hasTableAccess ? 3 : 7`
+      If `totalPotentialPlanks < requiredPlanks`, then you do NOT have enough materials yet and must gather more logs/planks before attempting the pickaxe.
+      Examples you MUST treat correctly:
+      - `5 planks + 4 sticks + no crafting_table nearby/in inventory` => NOT enough for `wooden_pickaxe`.
+      - `2 planks + 1 log + 4 sticks + no crafting_table nearby/in inventory` => NOT enough for `wooden_pickaxe`.
+      - `5 planks + 4 sticks + placed crafting_table nearby` => enough for `wooden_pickaxe`.
+      - `2 planks + 1 log + 4 sticks + crafting_table item in inventory` => enough for `wooden_pickaxe`.
+      NEVER say "you already have enough materials" for a wooden pickaxe unless this arithmetic checks out.
+    7e) MINING HIERARCHY (enforce this — using the wrong tool yields nothing):
+      - dirt, sand, gravel, podzol, coarse_dirt, clay, snow: bare hand works, but a **shovel is ~2x faster** — if you have any `_shovel` in inventory, equip it first via `await bot.equip(shovel, 'hand')` before mining a stack of dirt/sand/etc. Wooden_shovel recipe = 1 plank + 2 sticks (cheap; craft one if you'll be moving lots of dirt).
+      - wood logs / wood / stems / hyphae: prefer an axe if you already have one; on this server bare hands may break the block but still yield zero drops. NEVER plan "craft axe first" unless current inventory already contains enough materials to do it now: either an existing axe, or at least 3 planks + 2 sticks, or enough logs in inventory to convert into those planks. A `crafting_table` in inventory does NOT help if you only have 2 planks; `wooden_axe` still needs 3 planks. If inventory looks like `2 planks + 4 sticks + 1 crafting_table`, you are STILL missing 1 plank and must mine or craft that plank first. If inventory has fewer than 3 planks and no spare logs, do a real generic `mineBlock(bot, 'wood log', count)` attempt first instead of inventing an impossible axe-crafting step.
+        - stone, cobblestone, coal_ore: wooden_pickaxe or better
+          **IMPORTANT: mining a `stone` block drops `cobblestone`, NOT `stone`. After `mineBlock(bot, 'stone', n)`, check `bot.inventory.items()` for `cobblestone`, not `stone`. Never check for `item.name === 'stone'` as a success condition for a mine-stone task.**
+        - iron_ore, lapis_ore: stone_pickaxe or better
+        - diamond_ore, gold_ore, emerald_ore, redstone_ore: iron_pickaxe or better
+        - obsidian, ancient_debris: diamond_pickaxe or better
+        - **`barrier`**: this is the proxy's "unknown modded decoration" placeholder. Do NOT try to mine it; it is unmineable and not the block you think it is. Skip these positions entirely.
+        Before mining a block, check if you have the right pickaxe in `bot.inventory.items()`. If not, craft one first (you need planks + sticks + crafting table; for stone pickaxe you also need cobblestone, which means you needed a wooden pickaxe first).
+    7e1) **PREREQUISITE-CHAIN PLANNING — mandatory for any task that names a block/item the bot cannot immediately obtain.** Before writing code, walk the dependency tree BACKWARDS from the target until every leaf is something you already have or can pick up bare-handed. Then write the code FORWARDS, satisfying each prerequisite as a numbered step in your Plan. Do NOT jump straight to the target — the bot will fail and waste retries.
+        Worked example — task "Mine 1 stone" with empty inventory:
+          - Stone needs `wooden_pickaxe` (rule 7e).
+          - `wooden_pickaxe` recipe = 3 planks + 2 sticks, on a crafting_table.
+          - `crafting_table` recipe = 4 planks (no table needed; rule 7d).
+          - `stick` recipe = 2 planks → 4 sticks (no table needed; rule 7d).
+          - `planks` recipe = 1 log → 4 planks (no table needed; rule 7d).
+          - `log` is the leaf — reachable on foot, but on this server do NOT assume it will drop bare-handed.
+        => Plan steps: (1) gather ≥3 logs, (2) craft ≥12 planks, (3) craft ≥4 sticks, (4) craft 1 crafting_table, (5) place crafting_table adjacent, (6) craft 1 wooden_pickaxe, (7) equip pickaxe, (8) findBlock stone within 32, (9) mineBlock stone, count=1. After step 9 verify success by counting `cobblestone` (NOT `stone`) in inventory — stone blocks drop cobblestone.
+        At every step, FIRST check `bot.inventory.items()` to see if the prerequisite is already satisfied — skip the step if so. Never assume the inventory is empty; it may already contain planks, sticks, or even a pickaxe from prior tasks.
+        The same backward-walk applies to: stone_pickaxe (needs cobblestone → needs wooden_pickaxe → …), iron_pickaxe (needs iron_ingot → needs furnace → needs cobblestone → …), shield (needs iron_ingot + planks), bucket (3 iron_ingots → smelt 3 iron_ore → mine with stone_pickaxe → …). If you can't trace the chain to leaves you can hand-mine, the task is currently impossible — `bot.chat("Failed: missing prerequisite <X>")` and exit.
+    7f) BLOCK NAMES are species-specific in modern Minecraft. There is NO block called "leaves", "log", "wood", or "planks". Use the full name: `oak_leaves`, `birch_log`, `spruce_planks`, etc. When you need to match any wood-related block, iterate over a list of known names and skip any that `mcData.blocksByName[name]` returns undefined for (modded blocks may not be in mcData at all — fall back to scanning `bot.findBlocks` results by `block.name.endsWith('_log')`).
+    7g) FOOD & SURVIVAL: if `bot.food < 16` and you have any food in inventory (anything matching `_apple`, `bread`, `cooked_`, `_beef`, `_porkchop`, `_chicken`, `_mutton`, `_rabbit`, `_cod`, `_salmon`, `carrot`, `potato`, `melon_slice`, `sweet_berries`, etc.), equip and eat it: `await bot.equip(foodItem, 'hand'); await bot.consume();`. Don't let the bot starve while it works.
+    7h) NIGHT & HOSTILE MOBS: if `bot.time.timeOfDay > 13000 && bot.time.timeOfDay < 23000` (night), the BEST option is a Comforts `sleeping_bag` (any color) — it lets you skip to morning at any time of day and sets spawn. Place it (`placeItem(bot, 'red_sleeping_bag', adjacentPos)`) and `await bot.activateBlock(bagBlock)` to sleep. If no sleeping bag and no bed, dig a 1x2 hole into the nearest hill or wall and seal with dirt/cobblestone. If a hostile mob (zombie, skeleton, creeper, spider, phantom) is within 8 blocks in `bot.entities`, either fight (only if you have a sword and food > 18) or retreat. Creepers: keep distance > 4 blocks. Skeletons: close the gap or break line-of-sight.
+    7i) INVENTORY FULL: if `bot.inventory.emptySlotCount() === 0`, drop junk before mining more. Junk = dirt, cobblestone (if not collecting it), sand, gravel, rotten_flesh, sapling overflow. Use `await bot.tossStack(item)` to drop a stack.
+    7j) BE PROACTIVE LIKE A PLAYER: don't just do the literal task. If you're mining wood and you see coal_ore exposed nearby — grab it. If you're crafting and have spare planks — craft a few extra sticks. If you walk past a sheep and have no bed — kill it for wool. The progression toward iron tools, food, shelter is implicit in every early-game task.
+    7k) MOD AWARENESS — this server runs Forge 1.18.2 with these gameplay mods. Use their items when they help. Item names are best-guesses; if `mcData.itemsByName[name]` is undefined, the item exists only via its mod's namespace, so check `bot.inventory.items()` by name suffix instead of by id.
+        - **BiomesOPlenty + Compat-O-Plenty**: many extra wood types (`fir_log`, `pine_log`, `palm_log`, `redwood_log`, `magic_log`, `dead_log`, `jacaranda_log`, `mahogany_log`, `willow_log`, `umbran_log`, `hellbark_log`, `cherry_log`, `empyreal_log`) and matching `_planks`. Also new gems: `amber`, `malachite`, `peridot`, `topaz`, `ruby`, `sapphire`, `tanzanite` (mineable from their respective ores with iron pickaxe). When iterating wood types, also include these.
+        - **Quark + QuarkOddities**: blossom logs (`blue_blossom_log`, `orange_blossom_log`, `pink_blossom_log`, `red_blossom_log`, `yellow_blossom_log`, `lavender_blossom_log`), new stones (`limestone`, `jasper`, `marble`, `slate`), and `backpack` (massively expands inventory — craft one early if you have leather + string). Quark ladders place upward easily. `framed_glass`, `iron_rod`, `chain` available. Also **stripped log variants** of every wood for axe efficiency.
+        - **Twilight Forest**: portal recipe = dig a 2x2x1 hole, fill with water, surround with flowers/grass/mushrooms, then throw a diamond into the water. Inside dimension: `twilight_oak_log`, `canopy_log`, `mangrove_log`, `darkwood_log`, `time_log`, `transformation_log`, `mining_log`, `sorting_log`. DO NOT enter without iron armor + sword + shield + food.
+        - **Comforts**: `sleeping_bag` (any color: `red_sleeping_bag`, `white_sleeping_bag`, etc.) lets you SKIP TO MORNING / SET SPAWN at ANY TIME OF DAY (no need for night). Recipe = 3 wool same color + 3 planks (no need for a bed). USE THIS for safety — when in danger or low on time, place a sleeping_bag and `bot.activateBlock(bagBlock)` to sleep. Hammocks let you sleep but don't skip night.
+        - **Bedspreads**: colored beds craftable from any wool + 3 planks (vanilla recipe still works).
+        - **Waystones**: craft a `waystone` (4 stone bricks + 4 chiseled stone bricks + 1 deepslate, roughly) and place it at your base. Right-clicking sets a teleport point you can return to from anywhere via the `warp_scroll` or by approaching another waystone. CRITICAL for not getting lost on long expeditions — drop one at spawn, one at any deep mine. Use `bot.activateBlock(waystoneBlock)` to interact.
+        - **Farmer's Delight + Farmer's Respite + Corn Delight**: `cooking_pot` (3 iron ingots, 1 brick, 1 wool, 4 planks shaped) + `cutting_board` (3 wood slabs + 1 axe-shaped — actually 1 wood slab + 1 axe). Crops: `tomato`, `onion` (find wild), `cabbage`, `rice` (in swamp), `corn`. Better food output: `bread` from rice/wheat is fine; `cooked_pasta_with_meatballs`, `vegetable_soup`, `chicken_sandwich`, `beef_stew` all give MUCH more saturation than raw cooked meat. Use `knife` (`flint_knife`, `iron_knife`, etc.) to butcher animals for more drops and cut crops. Eat any item ending in `_soup`, `_stew`, `_sandwich`, `_pasta`, `_pie` for top-tier food.
+        - **Paraglider**: craft `paraglider` (4 sticks + 4 cloth/wool — recipe varies). Equip in offhand; while falling, holding jump opens it (use `bot.setControlState('jump', true)` mid-fall). Eliminates fall damage — useful when descending mountains or jumping off cliffs to a target. Also `heart_container` and `stamina_vessel` from boss drops increase max health/stamina.
+        - **Overweight Farming**: large versions of crops (giant carrot, giant potato, giant beetroot). Slice with axe for many normal crops. If you see one in a village, harvest it.
+        - **Supplementaries**: useful items: `flax` (string substitute), `rope` (climbable), `goblet`, `jar` (store water/items in 1 slot), `ash` (from burnt logs).
+        - **Twigs**: `paper` from sugarcane, `table` (decorative), `tomb` blocks. Mostly cosmetic.
+        - **Ars Nouveau**: complex magic mod. SKIP unless task explicitly requires magic.
+        - **FTB Ultimine**: requires holding a modifier key — bot CANNOT use this. Mine vein-by-vein normally.
+        - **Walljump / Goprone**: niche; ignore unless stuck.
+        Mod hint: villages may contain modded crops, waystones (already-placed!), and Farmer's Delight cooking stations — explore villages early to grab free infrastructure.
     8) `maxDistance` should always be 32 for `bot.findBlocks` and `bot.findBlock`. Do not cheat.
+    8x) **NO CHAT COMMANDS / NO CHEATS.** The bot must behave like a real human player. NEVER call `bot.chat("/...")` for ANY of these: `/tp`, `/teleport`, `/spreadplayers`, `/setblock`, `/fill`, `/give`, `/clear`, `/effect`, `/kill`, `/gamerule`, `/time`, `/weather`, `/locate`, `/summon`, `/xp`, `/op`, `/gamemode`. The only allowed `bot.chat` calls are pure text messages for logging (e.g. `bot.chat("Done: mined 1 wood log.")`). To move: use `bot.pathfinder.goto(...)`. To recover from being lost: walk in a direction with pathfinder, do NOT teleport. To escape lava/fire: walk away with pathfinder (`new GoalNear(bot.entity.position.x + 30, bot.entity.position.y, bot.entity.position.z, 1)`), do NOT spread. To get a tool you don't have: craft it from materials you can mine, do NOT /give. If you can't reach a goal in 60s, give up and `bot.chat("Failed: <reason>")`.
+    8z) **HAZARD AVOIDANCE — be brave, not paranoid**: Lava and fire are only dangerous if you would actually step into them or stand directly adjacent. A real player happily mines wood with lava 2-3 blocks away, or with magma underground covered by ground. DO NOT pre-emptively run from lava/fire. Just mine the target block. Only consider relocating if `bot.findBlock({{ matching: b => b && (b.name === "lava" || b.name === "fire"), maxDistance: 2 }})` returns something AND it is at the same Y or above the bot. Even then, just step 2-3 blocks away with pathfinder, do not flee 20 blocks. NEVER use `/spreadplayers` or `/tp`. Trust the pathfinder + the bot's adventurous defaults — surrounding modded blocks are walkable.
+    8a) When searching for wood logs, NEVER look for only one specific log type (e.g. only 'birch_log'). The bot's biome may not contain that species. ALWAYS search for ANY log/wood block by name suffix, rank visible/nearest hits first, and for a generic wood task call `mineBlock(bot, 'wood log', count)` rather than freezing one species with `logBlock.name`. Do NOT turn the first-log plan into "find a visible log, then craft an axe, then mine that exact species"; if inventory has no logs yet, just make one real generic wood-mining attempt first. The same rule applies later if inventory still cannot support the axe recipe: with only `2 planks + 4 sticks + 1 crafting_table`, do NOT say "you already have planks and sticks, so craft a wooden axe".
+        CRITICAL for tasks like `Mine 3 wood log`: do NOT hand-roll your own `decorNearby()`, `reachableLogNearby()`, or repeated `exploreUntil(..., 90, ...)` search loops. Those loops keep wandering around decorative spawn pockets and time out without ever mining. Instead, call `ensureLogsReachable(bot)` once, then immediately use `await mineBlock(bot, 'wood log', count)`. If `ensureLogsReachable(bot)` returns false, fail fast with chat instead of wandering for another 90 seconds.
+        Required pattern for any generic wood task when you still need logs:
+        ```js
+        bot.chat("Checking for reachable logs.");
+        if (!(await ensureLogsReachable(bot))) {{
+          bot.chat("Failed: could not find reachable wood logs.");
+          return;
+        }}
+        bot.chat("Mining 3 wood logs.");
+        await mineBlock(bot, 'wood log', 3);
+        ```
+        ALSO filter out buried/underground logs — a log whose y is more than 2 below the bot's y is almost certainly inside a cave or under stone, and trying to path to it will burn 60+ seconds digging through stone you can't mine yet (no pickaxe). Use this exact pattern — it works for vanilla and ALL modded woods without needing any whitelist constant:
+        let logBlock = null;
+        const _botY = Math.floor(bot.entity.position.y);
+        const _logMatcher = (b) => b && (b.name.endsWith('_log') || b.name.endsWith('_wood') || b.name.endsWith('_stem') || b.name.endsWith('_hyphae'));
+        const _reachable = (pos) => pos && pos.y >= _botY - 2;
+      const _rankLogs = (hits) => hits
+        .map(pos => bot.blockAt(pos))
+        .filter(block => block && _reachable(block.position))
+        .sort((a, b) => {{
+        const av = (() => {{ try {{ return bot.canSeeBlock(a) ? 1 : 0; }} catch {{ return 0; }} }})();
+        const bv = (() => {{ try {{ return bot.canSeeBlock(b) ? 1 : 0; }} catch {{ return 0; }} }})();
+        if (av !== bv) return bv - av;
+        return a.position.distanceTo(bot.entity.position) - b.position.distanceTo(bot.entity.position);
+        }});
+      let _logHits = _rankLogs(bot.findBlocks({{ matching: _logMatcher, maxDistance: 32, count: 16 }}));
+      if (_logHits.length > 0) logBlock = _logHits[0];
+        if (!logBlock) {{
+            // No reachable log within 32 blocks — explore (random horizontal direction, never zero).
+            const _dx = [-1,1][Math.floor(Math.random()*2)];
+            const _dz = [-1,0,1][Math.floor(Math.random()*3)];
+            await exploreUntil(bot, new Vec3(_dx, 0, _dz), 60, () => {{
+          const h = _rankLogs(bot.findBlocks({{ matching: _logMatcher, maxDistance: 32, count: 16 }}));
+          return h.length > 0 ? h[0] : null;
+            }});
+        const _h2 = _rankLogs(bot.findBlocks({{ matching: _logMatcher, maxDistance: 32, count: 16 }}));
+        if (_h2.length > 0) logBlock = _h2[0];
+        }}
+      // If nearby blocks also contain decorative markers like pink_wool / oak_sign / fire,
+      // treat the whole local cluster as spawn decor and explore away BEFORE calling mineBlock.
+      const _isDecorMarker = (name) => !!(name && (name.endsWith('_wool') || name.endsWith('_sign') || name === 'fire' || name === 'campfire' || name === 'soul_campfire'));
+      const _decorNearby = bot.findBlocks({{ matching: (b) => b && _isDecorMarker(b.name), maxDistance: 8, count: 8 }});
+      if (_decorNearby.length > 0) {{
+        await exploreUntil(bot, _pickDir(), 90, () => {{
+          const _decor2 = bot.findBlocks({{ matching: (b) => b && _isDecorMarker(b.name), maxDistance: 8, count: 8 }});
+          const _logs2 = _rankLogs(bot.findBlocks({{ matching: _logMatcher, maxDistance: 32, count: 16 }}));
+          return _decor2.length === 0 && _logs2.length > 0 ? _logs2[0] : null;
+        }});
+        const _h3 = _rankLogs(bot.findBlocks({{ matching: _logMatcher, maxDistance: 32, count: 16 }}));
+        if (_h3.length > 0) logBlock = _h3[0];
+      }}
+      if (logBlock) await mineBlock(bot, 'wood log', count);
+      // CRITICAL: do NOT reference any variable named LOG_TYPES — it does not exist. Use the suffix matcher above. Even if the task says "birch log" specifically, satisfy it with ANY log type — the curriculum will accept any wood as progress. Do NOT keep retrying birch just because it was the first hit; let generic `mineBlock` rescan all nearby logs.
+        // CRITICAL: do NOT remove the y-filter. A jungle_wood log at y=57 when the bot is at y=63 is BURIED — pathing to it will deadlock because you have no pickaxe to dig stone.
     9) Do not write infinite loops or recursive functions.
     10) Do not use `bot.on` or `bot.once` to register event listeners. You definitely do not need them.
     11) Name your function in a meaningful way (can infer the task from the name).

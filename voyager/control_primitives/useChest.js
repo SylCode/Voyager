@@ -78,10 +78,15 @@ async function moveToChest(bot, chestPosition) {
         );
     }
     if (chestPosition.distanceTo(bot.entity.position) > 32) {
-        bot.chat(
-            `/tp ${chestPosition.x} ${chestPosition.y} ${chestPosition.z}`
-        );
-        await bot.waitForTicks(20);
+        // HUMAN-LIKE: walk to the chest with pathfinder instead of /tp.
+        const { GoalNear } = require("mineflayer-pathfinder").goals;
+        try {
+            await bot.pathfinder.goto(
+                new GoalNear(chestPosition.x, chestPosition.y, chestPosition.z, 2)
+            );
+        } catch (e) {
+            throw new Error(`Cannot reach chest at ${chestPosition}: ${e.message}`);
+        }
     }
     const chestBlock = bot.blockAt(chestPosition);
     if (chestBlock.name !== "chest") {

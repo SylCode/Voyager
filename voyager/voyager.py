@@ -161,6 +161,9 @@ class Voyager:
         self.messages = None
         self.conversations = []
         self.last_events = None
+        # Inventory snapshot at the beginning of the current attempt, used by the
+        # critic to judge mine/craft/smelt success via a true delta.
+        self.attempt_start_inventory = {}
 
     def reset(self, task, context="", reset_env=True):
         self.action_agent_rollout_num_iter = 0
@@ -181,6 +184,16 @@ class Voyager:
             "bot.chat(`/time set ${getNextTime()}`);\n"
             + f"bot.chat('/difficulty {difficulty}');"
         )
+        # ── Auto-recover death totem if the bot died last task ──────────────
+        try:
+            last_status = events[-1][1] if events else {}
+            if last_status.get("deathPos"):
+                print(
+                    "\033[35m[rollout] death position detected – running recoverDeathTotem\033[0m"
+                )
+                events = self.env.step("await recoverDeathTotem(bot);")
+        except Exception as _e:
+            print(f"[rollout] recoverDeathTotem step failed (non-fatal): {_e}")
         skills = self.skill_manager.retrieve_skills(query=self.context)
         print(
             f"\033[33mRender Action Agent system message with {len(skills)} skills\033[0m"
@@ -189,6 +202,14 @@ class Voyager:
         human_message = self.action_agent.render_human_message(
             events=events, code="", task=self.task, context=context, critique=""
         )
+        # Snapshot inventory now so the first attempt's delta is computed
+        # against the true pre-attempt state (events[-1] is the post-state).
+        try:
+            self.attempt_start_inventory = dict(
+                events[-1][1].get("inventory", {}) or {}
+            )
+        except Exception:
+            self.attempt_start_inventory = {}
         self.messages = [system_message, human_message]
         print(
             f"\033[32m****Action Agent human message****\n{human_message.content}\033[0m"
@@ -203,7 +224,9 @@ class Voyager:
     def step(self):
         if self.action_agent_rollout_num_iter < 0:
             raise ValueError("Agent must be reset before stepping")
-        ai_message = self.action_agent.llm(self.messages)
+        ai_message = self.action_agent.deterministic_response(self.task)
+        if ai_message is None:
+            ai_message = self.action_agent.llm.invoke(self.messages)
         print(f"\033[34m****Action Agent ai message****\n{ai_message.content}\033[0m")
         self.conversations.append(
             (self.messages[0].content, self.messages[1].content, ai_message.content)
@@ -218,13 +241,42 @@ class Voyager:
             )
             self.recorder.record(events, self.task)
             self.action_agent.update_chest_memory(events[-1][1]["nearbyChests"])
+
+            # If the bot died during this step, abandon the task immediately —
+            # no point retrying with a freshly respawned, empty-handed bot.
+            _bot_died = any(
+                event_type == "onError"
+                and "bot died" in event.get("onError", "").lower()
+                for event_type, event in events
+            )
+            if _bot_died:
+                print(
+                    "\033[35m[step] Bot died during task — abandoning without retry\033[0m"
+                )
+                self.action_agent_rollout_num_iter = self.action_agent_task_max_retries
+                self.last_events = copy.deepcopy(events)
+                info = {
+                    "task": self.task,
+                    "success": False,
+                    "conversations": self.conversations,
+                }
+                return self.messages, 0, True, info
+
             success, critique = self.critic_agent.check_task_success(
                 events=events,
                 task=self.task,
                 context=self.context,
                 chest_observation=self.action_agent.render_chest_observation(),
                 max_retries=5,
+                prev_inventory=self.attempt_start_inventory,
             )
+            # Roll the snapshot forward: next attempt starts from this state.
+            try:
+                self.attempt_start_inventory = dict(
+                    events[-1][1].get("inventory", {}) or {}
+                )
+            except Exception:
+                self.attempt_start_inventory = {}
 
             if self.reset_placed_if_failed and not success:
                 # revert all the placing event in the last step
@@ -286,6 +338,29 @@ class Voyager:
 
     def rollout(self, *, task, context, reset_env=True):
         self.reset(task=task, context=context, reset_env=reset_env)
+        # Short-circuit: if the bot's CURRENT inventory already satisfies a
+        # deterministic mine/craft/smelt task (e.g. "Mine 3 stone" when 21
+        # cobblestone is already in inventory), don't invoke the action agent
+        # at all — just mark it complete. Avoids burning retries and tokens
+        # on tasks that are already done.
+        try:
+            inventory = (
+                self.last_events[-1][1].get("inventory", {}) if self.last_events else {}
+            )
+            preempt = self.critic_agent._deterministic_task_success(
+                task=task,
+                gained={},
+                inventory=inventory,
+            )
+            if preempt is not None and preempt[0]:
+                print(
+                    f"\033[36m[rollout] task '{task}' already satisfied by current "
+                    f"inventory; skipping action agent.\033[0m"
+                )
+                info = {"task": task, "success": True, "conversations": []}
+                return self.messages, 0, True, info
+        except Exception as _e:
+            print(f"[rollout] preempt-check failed (non-fatal): {_e}")
         while True:
             messages, reward, done, info = self.step()
             if done:
@@ -312,6 +387,37 @@ class Voyager:
             self.resume = True
         self.last_events = self.env.step("")
 
+        # ── Capture / restore home position ──────────────────────────────────
+        # Home position = the bot's surface spawn location, recorded once and
+        # reused across restarts. All chests and appliances should be near here.
+        _home_pos_file = f"{self.recorder.ckpt_dir}/home_position.json"
+        if os.path.exists(_home_pos_file):
+            try:
+                self._home_position = U.load_json(_home_pos_file)
+                print(
+                    f"\033[35m[Home] Loaded home position: {self._home_position}\033[0m"
+                )
+            except Exception as _he:
+                print(f"[Home] Failed to load home_position.json: {_he}")
+                self._home_position = None
+        else:
+            try:
+                _pos = self.last_events[-1][1]["status"]["position"]
+                self._home_position = {
+                    "x": round(_pos["x"]),
+                    "y": round(_pos["y"]),
+                    "z": round(_pos["z"]),
+                }
+                U.dump_json(self._home_position, _home_pos_file)
+                print(
+                    f"\033[35m[Home] Recorded home position: {self._home_position}\033[0m"
+                )
+            except Exception as _he:
+                print(f"[Home] Failed to record home position: {_he}")
+                self._home_position = None
+        # Share home position with action agent so it filters chest observation
+        self.action_agent.home_position = self._home_position
+
         while True:
             if self.recorder.iteration > self.max_iterations:
                 print("Iteration limit reached")
@@ -320,10 +426,70 @@ class Voyager:
                 events=self.last_events,
                 chest_observation=self.action_agent.render_chest_observation(),
                 max_retries=5,
+                preempt_check=self.critic_agent._deterministic_task_success,
+                home_position=getattr(self, "_home_position", None),
             )
             print(
                 f"\033[35mStarting task {task} for at most {self.action_agent_task_max_retries} times\033[0m"
             )
+            # Safety: if the bot is currently in water, wait a few seconds for
+            # the water-escape ticker to surface it before starting any task.
+            try:
+                _last_obs = self.last_events[-1][1] if self.last_events else {}
+                _biome = _last_obs.get("status", {}).get("biome", "")
+                _blocks = _last_obs.get("nearbyBlocks", [])
+                if isinstance(_blocks, list) and any(
+                    "water" in str(b).lower() for b in _blocks
+                ):
+                    print(
+                        "\033[35m[Safety] Bot near water — waiting 5 s before starting task.\033[0m"
+                    )
+                    import time as _time_w
+
+                    _time_w.sleep(5)
+            except Exception:
+                pass
+
+            # If the bot is underground and needs to deposit loot, teleport home
+            # first via /home so it arrives next to the base chests instantly.
+            # "Underground" = biome tag set to "underground" by the curriculum
+            # observation renderer (no surface blocks nearby).
+            try:
+                _deposit_task = task.startswith(
+                    "Deposit useless items into the chest at"
+                )
+                if _deposit_task:
+                    _obs = self.last_events[-1][1] if self.last_events else {}
+                    _voxels = _obs.get("voxels", [])
+                    _surface_names = {
+                        "dirt",
+                        "grass_block",
+                        "coarse_dirt",
+                        "podzol",
+                        "mycelium",
+                        "rooted_dirt",
+                        "sand",
+                        "gravel",
+                        "snow_block",
+                        "moss_block",
+                    }
+                    _is_underground = not any(
+                        any(s in str(v) for s in _surface_names) for v in _voxels
+                    )
+                    _pos_y = _obs.get("status", {}).get("position", {}).get("y", 64)
+                    # Also consider underground if y < 40 regardless of biome tag
+                    if _is_underground or _pos_y < 40:
+                        print(
+                            f"\033[35m[Home] Bot underground (y={_pos_y:.0f}) before deposit — "
+                            "issuing /home to teleport to base\033[0m"
+                        )
+                        self.last_events = self.env.step(
+                            "bot.chat('/home');\n"
+                            "await new Promise(r => setTimeout(r, 3000));"
+                        )
+            except Exception as _home_err:
+                print(f"[Home] Pre-deposit /home step failed (non-fatal): {_home_err}")
+
             try:
                 messages, reward, done, info = self.rollout(
                     task=task,
@@ -351,7 +517,10 @@ class Voyager:
                 print(f"\033[41m{e}\033[0m")
 
             if info["success"]:
-                self.skill_manager.add_new_skill(info)
+                # Preempted tasks (already-satisfied inventory) have no program
+                # to register; only add a skill if the action agent ran.
+                if "program_name" in info:
+                    self.skill_manager.add_new_skill(info)
 
             self.curriculum_agent.update_exploration_progress(info)
             print(

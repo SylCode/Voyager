@@ -1,3 +1,6 @@
+// IMPORTANT: Use console.log() for all debug and status messages in your code.
+// Only call bot.chat() for the single final success or failure line at the very end.
+// Calling bot.chat() many times per second causes the server to kick the bot for spamming.
 await bot.pathfinder.goto(goal); // A very useful function. This function may change your main-hand equipment.
 // Following are some Goals you can use:
 new GoalNear(x, y, z, range); // Move the bot to a block within the specified range of the specified block. `x`, `y`, `z`, and `range` are `number`
