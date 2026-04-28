@@ -668,6 +668,9 @@ app.post("/step", async (req, res) => {
     // Counts how many times the unstucker ran out of escape material in this
     // reset cycle without the bot moving free. After 2 failures we use /home.
     bot._noMaterialEscapeFailCount = 0;
+    // Escalating obstacle-escape tier: increments each teleportBot() call,
+    // resets when the bot makes meaningful progress.
+    bot._stuckEscapeAttempts = 0;
 
     // Issue /sethome once on first spawn so /home always returns to the
     // starting surface area (useful if the bot later falls into a cave).
@@ -848,8 +851,9 @@ app.post("/step", async (req, res) => {
             if (posDifference < posThreshold) {
                 teleportBot(); // execute the function
             } else {
-                // Bot moved enough — reset the no-material escape counter.
+                // Bot moved enough — reset all escape counters.
                 bot._noMaterialEscapeFailCount = 0;
+                bot._stuckEscapeAttempts = 0;
             }
 
             // Remove the oldest time from the list
@@ -870,36 +874,71 @@ app.post("/step", async (req, res) => {
         const isAir = (b) => b && b.name === "air";
         const isLiquid = (b) => b && (b.name === "water" || b.name === "lava");
 
+        bot._stuckEscapeAttempts = (bot._stuckEscapeAttempts || 0) + 1;
+        const _escPhase = bot._stuckEscapeAttempts;
+        console.log(`[teleportBot] phase=${_escPhase}`);
+
         (async () => {
             try {
                 const pos = bot.entity.position.floored();
 
-                // ── Tier 1: GoalNear adjacent walkable air (existing behaviour) ──
-                // GUARD: Do NOT hijack pathfinder if it is already pursuing a goal
-                // set by user code (e.g. CollectBlock's goto). Replacing that
-                // goal makes the in-flight goto reject with "GoalChanged" and
-                // creates a deathloop where mineBlock retries forever and we
-                // keep stealing its goal. Only run tier 1 if pathfinder is idle.
-                try {
-                    // Do not inject pathfinder goals from the unstucker.
-                    // This still races with collectBlock/mineBlock and causes
-                    // GoalChanged failures even when the bot is in a valid
-                    // mining run. The remaining tiers use jump/dig/walk
-                    // controls directly and are enough for local rescue.
-                } catch { /* fall through */ }
-
-                // ── Tier 2: jump nudge (helps with 1-block lips, fences, edges) ──
-                if (bot.setControlState) {
-                    bot.setControlState("jump", true);
-                    setTimeout(() => bot.setControlState && bot.setControlState("jump", false), 350);
+                // ── Phase 1–2: Jump over the obstacle ────────────────────────────
+                // A single 1-block-high obstacle is the most common blockage during
+                // navigation. Jumping is always the cheapest fix — try it first.
+                if (_escPhase <= 2) {
+                    if (bot.setControlState) {
+                        bot.setControlState("jump", true);
+                        // Also step forward so the jump carries us over the lip.
+                        bot.setControlState("forward", true);
+                        setTimeout(() => {
+                            bot.setControlState && bot.setControlState("jump", false);
+                            bot.setControlState && bot.setControlState("forward", false);
+                        }, 500);
+                    }
+                    console.log(`[teleportBot] jump attempt ${_escPhase}`);
+                    return;
                 }
 
-                // ── Tier 3: dig the block in front of us in any cardinal dir ─────
-                // Real players mine their way out. Look for any solid, non-liquid,
-                // non-bedrock block adjacent at head/feet height and break it.
+                // ── Phase 3–4: Pillar up (jump + place under feet) ───────────────
+                // After 2 failed jumps the obstacle is > 1 block tall. Gain 1–2
+                // blocks of height by placing junk blocks under the bot's feet
+                // while jumping — enough to hop over most obstacles.
+                if (_escPhase <= 4) {
+                    // Prefer true junk: dirt/gravel/sand/cobblestone/planks/log.
+                    const placeable = bot.inventory.items().find((it) => it && (
+                        it.name === "dirt" || it.name === "gravel" || it.name === "sand" ||
+                        it.name === "cobblestone" || it.name === "netherrack" ||
+                        it.name.endsWith("_planks") || it.name.endsWith("_log") ||
+                        it.name === "stone"
+                    ));
+                    if (placeable) {
+                        try {
+                            await bot.equip(placeable, "hand");
+                            for (let _pi = 0; _pi < 3; _pi++) {
+                                bot.setControlState("jump", true);
+                                await new Promise((r) => setTimeout(r, 100));
+                                const _feet = bot.entity.position.floored();
+                                const _ref = bot.blockAt(_feet.offset(0, -1, 0));
+                                if (_ref && !isAir(_ref) && !isLiquid(_ref)) {
+                                    try { await bot.placeBlock(_ref, new Vec3(0, 1, 0)); } catch { /* timing */ }
+                                }
+                                await new Promise((r) => setTimeout(r, 200));
+                                bot.setControlState("jump", false);
+                            }
+                            console.log(`[teleportBot] pillar attempt ${_escPhase}`);
+                            return;
+                        } catch { /* fall through to dig */ }
+                    } else {
+                        console.log(`[teleportBot] no junk blocks for pillar — skipping to dig`);
+                    }
+                }
+
+                // ── Phase 5+: Dig the obstacle ───────────────────────────────────
+                // Jump and pillar both failed (or no inventory blocks available).
+                // Break the solid block(s) blocking progress in any cardinal dir.
                 for (const d of dirs) {
-                    const at = pos.plus(d);            // foot-level neighbour
-                    const above = at.offset(0, 1, 0);  // head-level neighbour
+                    const at = pos.plus(d);            // foot-level
+                    const above = at.offset(0, 1, 0);  // head-level
                     for (const target of [at, above]) {
                         const b = bot.blockAt(target);
                         if (!b || isAir(b) || isLiquid(b)) continue;
@@ -907,42 +946,13 @@ app.post("/step", async (req, res) => {
                         try {
                             await bot.lookAt(target.offset(0.5, 0.5, 0.5), true);
                             await bot.dig(b);
-                            return; // success — onStuck will retry next cycle if still stuck
+                            console.log(`[teleportBot] dug ${b.name} at ${target}`);
+                            return;
                         } catch { /* try next */ }
                     }
                 }
 
-                // ── Tier 4: pillar up — jump and place a block under our feet ────
-                // Useful when we're in a hole or a 1-block puddle and tier 3 found
-                // only liquid/air around us. Need *any* placeable block in inventory.
-                const placeable = bot.inventory.items().find((it) => it && (
-                    it.name.endsWith("_planks") ||
-                    it.name === "dirt" || it.name === "cobblestone" ||
-                    it.name === "stone" || it.name === "netherrack" ||
-                    it.name.endsWith("_log")
-                ));
-                if (placeable) {
-                    try {
-                        await bot.equip(placeable, "hand");
-                        for (let i = 0; i < 3; i++) {
-                            bot.setControlState("jump", true);
-                            await new Promise((r) => setTimeout(r, 80));
-                            const feet = bot.entity.position.floored();
-                            const ref = bot.blockAt(feet.offset(0, -1, 0));
-                            if (ref && !isAir(ref) && !isLiquid(ref)) {
-                                try {
-                                    await bot.placeBlock(ref, new Vec3(0, 1, 0));
-                                } catch { /* might be timing — keep trying */ }
-                            }
-                            await new Promise((r) => setTimeout(r, 200));
-                            bot.setControlState("jump", false);
-                        }
-                        return;
-                    } catch { /* fall through */ }
-                }
-
-                // ── Tier 5: random walk for ~2s in a chosen direction ────────────
-                // Only walk toward directions that don't have lava/void in front.
+                // ── Fallback: random walk + /home ────────────────────────────────
                 const safeDirs = dirs.filter((d) => {
                     const ahead = pos.plus(d);
                     const b = bot.blockAt(ahead);
@@ -964,13 +974,11 @@ app.post("/step", async (req, res) => {
                     } catch { /* fall through */ }
                 }
 
-                // ── Tier 6: /spawn — last resort when truly trapped with nothing ──
-                // Triggered after 2 consecutive no-material escapes that didn't free
-                // the bot (no placeable blocks, no diggable walls found either).
                 bot._noMaterialEscapeFailCount = (bot._noMaterialEscapeFailCount || 0) + 1;
                 if (bot._noMaterialEscapeFailCount >= 2) {
-                    console.log(`[teleportBot] /home fallback after ${bot._noMaterialEscapeFailCount} failed no-material escapes`);
+                    console.log(`[teleportBot] /home fallback after ${bot._noMaterialEscapeFailCount} failed escapes`);
                     bot._noMaterialEscapeFailCount = 0;
+                    bot._stuckEscapeAttempts = 0;
                     try { bot.chat("/home"); } catch (_) {}
                 }
             } catch (e) {
