@@ -1,7 +1,8 @@
-import pkg_resources
+import pathlib
 import voyager.utils as U
+
+_PROMPTS_DIR = pathlib.Path(__file__).parent
 
 
 def load_prompt(prompt):
-    package_path = pkg_resources.resource_filename("voyager", "")
-    return U.load_text(f"{package_path}/prompts/{prompt}.txt")
+    return U.load_text(str(_PROMPTS_DIR / f"{prompt}.txt"))

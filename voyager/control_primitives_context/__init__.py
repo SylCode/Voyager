@@ -1,10 +1,12 @@
-import pkg_resources
+import pathlib
 import os
 import voyager.utils as U
 
+_CPC_DIR = pathlib.Path(__file__).parent
+
 
 def load_control_primitives_context(primitive_names=None):
-    package_path = pkg_resources.resource_filename("voyager", "")
+    package_path = str(_CPC_DIR.parent)
     if primitive_names is None:
         primitive_names = [
             primitive[:-3]
